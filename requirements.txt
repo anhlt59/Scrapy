@@ -1,0 +1,10 @@
+requests
+Scrapy==1.8
+scrapy-splash
+selenium
+urllib3==1.24.1
+aiohttp
+asyncio
+scrapy_selenium
+selenium-wire
+redis
