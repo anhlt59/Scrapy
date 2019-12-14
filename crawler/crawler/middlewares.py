@@ -6,19 +6,21 @@
 # https://doc.scrapy.org/en/latest/topics/spider-middleware.html
 from urllib.parse import parse_qsl, urlparse
 from scrapy import signals
+from scrapy_splash import SplashRequest
 from scrapy.downloadermiddlewares.retry import RetryMiddleware
+from importlib import import_module
+from scrapy_selenium import SeleniumRequest
 from scrapy_selenium.middlewares import SeleniumMiddleware
 from scrapy.exceptions import DontCloseSpider, CloseSpider, NotConfigured
 from scrapy.http import HtmlResponse, TextResponse
 from seleniumwire import webdriver
-from itertools import cycle
-import json
 from json.decoder import JSONDecodeError
+import json
 import logging
 import re
 import time
+from rotating_proxies.middlewares import RotatingProxyMiddleware
 
-from .agents_n_proxies import AGENTS, PROXIES
 from .spiders.common.utils import obj
 from .spiders.common.http import ApiSplashRequest, ApiSeleniumRequest
 
@@ -51,63 +53,39 @@ class ScheduleRequestSpiderMiddleware:
 
         # Check start_request is empty
         if not empty:
-            self.logger.info(f'{spider.name} request more data')
+            raise DontCloseSpider
+            # self.logger.info(f'{spider.name} request more data')
         else:
             self.logger.info(f'Data is empty. Stop {spider.name}')
-            return None
-
-        raise DontCloseSpider
+            # raise CloseSpider(f'Data is empty. Stop {spider.name}')
 
 
-class CustomUserAgentProxyMiddleware:
-    # DownloadMiddleware
-    user_agent_list = cycle(AGENTS)
-    proxy_list = cycle(PROXIES)
-
-    def __init__(self, switch_user_agent, switch_proxy):
-        self.switch_user_agent = switch_user_agent
-        self.switch_proxy = switch_proxy
-
-    @classmethod
-    def from_crawler(cls, crawler):
-        settings = crawler.settings
-
-        middleware = cls(
-            switch_user_agent=settings.getbool('SWITCH_USER_AGENT', True),
-            switch_proxy=settings.getbool('SWITCH_PROXY', False)
-        )
-        return middleware
+class CustomRotatingProxyMiddleware(RotatingProxyMiddleware):
+    """ Random proxy per request. """
 
     def process_request(self, request, spider):
-        if self.switch_user_agent:
-            user_agent = next(self.user_agent_list)
-            request.headers['User-Agent'] = user_agent
+        """ Handle splash request."""
 
-        if self.switch_proxy:
-            endpoint, port = next(self.proxy_list)
-            request.meta['proxy'] = f'http://{endpoint}:{port}'
-            # request.headers['Proxy-Authorization'] = basic_authentication
+        if 'proxy' in request.meta and not request.meta.get('_rotating_proxy'):
+            return
+        proxy = self.proxies.get_random()
+        if not proxy:
+            if self.stop_if_no_proxies:
+                raise CloseSpider("no_proxies")
+            else:
+                logger.warn("No proxies available; marking all proxies as unchecked")
+                self.proxies.reset()
+                proxy = self.proxies.get_random()
+                if proxy is None:
+                    logger.error("No proxies available even after a reset.")
+                    raise CloseSpider("no_proxies_after_reset")
 
-
-class CustomRetryMiddleware(RetryMiddleware):
-
-    def retry_504(self, request, spider, retries=10):
-        """ Waiting for splash server restart."""
-        time.sleep(30)
-
-        reason = 'retry 504'
-        response = self._retry(request, reason, spider)
-
-        if not response and response.status == 504 and retries > 0:
-            return self.retry_504(request, spider, retries - 1)
-        return response
-
-    def process_response(self, request, response, spider):
-        if response.status == 504:
-            logging.info('504 - wait for splash restart')
-            return self.retry_504(self, request, spider)
-
-        return super().process_response(request, response, spider)
+        if isinstance(request, SplashRequest):
+            request.meta['splash']['proxy'] = proxy
+        else:
+            request.meta['proxy'] = proxy
+        request.meta['download_slot'] = self.get_proxy_slot(proxy)
+        request.meta['_rotating_proxy'] = True
 
 
 class CustomSeleniumWireMiddleware(SeleniumMiddleware):
@@ -131,10 +109,10 @@ class CustomSeleniumWireMiddleware(SeleniumMiddleware):
         self.driver_load_img = driver_load_img
         self.driver_disable_notify = driver_disable_notify
 
-        if driver_proxy:
-            self.proxy = cycle(PROXIES)
-        if driver_agent:
-            self.agent = cycle(AGENTS)
+        # if driver_proxy:
+        #     self.proxy = cycle(PROXIES)
+        # if driver_agent:
+        #     self.agent = cycle(AGENTS)
 
     def init_driver(self):
         # settings selenium
@@ -142,11 +120,11 @@ class CustomSeleniumWireMiddleware(SeleniumMiddleware):
         if self.browser_executable_path:
             driver_options.binary_location = self.browser_executable_path
 
-        # switch user_agent, proxy
-        if hasattr(self, 'agent'):
-            driver_options.add_argument(f"--user-agent='{next(self.agent)}'")
-        if hasattr(self, 'proxy'):
-            driver_options.add_argument(f"--proxy-server='{next(self.proxy)}'")
+        # # switch user_agent, proxy
+        # if hasattr(self, 'agent'):
+        #     driver_options.add_argument(f"--user-agent='{next(self.agent)}'")
+        # if hasattr(self, 'proxy'):
+        #     driver_options.add_argument(f"--proxy-server='{next(self.proxy)}'")
 
         # add SELENIUM_DRIVER_ARGUMENTS options
         for argument in self.driver_arguments:
@@ -243,7 +221,7 @@ class CustomSeleniumWireMiddleware(SeleniumMiddleware):
                     filted_request.append(req)
 
         # extract form request. #if fail stop process
-        result = [self.extract_form(req) for req in filted_request]
+        result = [self.extract_form(req, spider) for req in filted_request]
 
         # quit driver if keep_browser is false
         if not request.keep_browser:
@@ -262,7 +240,7 @@ class CustomSeleniumWireMiddleware(SeleniumMiddleware):
         if hasattr(self, 'driver'):
             self.driver.quit()
 
-    def extract_form(self, request):
+    def extract_form(self, request, spider):
         # get method (GET or POST)
         method = request.method.lower()
 
@@ -289,7 +267,7 @@ class CustomSeleniumWireMiddleware(SeleniumMiddleware):
         try:
             response = json.loads(request.response.body.decode())
         except Exception as e:
-            self.logger.critical(f'CustomSeleniumWireMiddleware - {e}')
+            self.logger.critical(f'CustomSeleniumWireMiddleware - {spider.name} - {e}')
             response = None
 
         # form request
@@ -303,3 +281,154 @@ class CustomSeleniumWireMiddleware(SeleniumMiddleware):
             },
             "response": response
         }
+
+
+class CustomSeleniumMiddleware(SeleniumMiddleware):
+
+    def __init__(self, driver_name, driver_executable_path, driver_arguments,
+                 browser_executable_path, driver_proxy, driver_agent,
+                 driver_load_img, driver_disable_notify):
+        webdriver_base_path = f'selenium.webdriver.{driver_name}'
+
+        driver_klass_module = import_module(f'{webdriver_base_path}.webdriver')
+        driver_klass = getattr(driver_klass_module, 'WebDriver')
+
+        driver_options_module = import_module(f'{webdriver_base_path}.options')
+        driver_options_klass = getattr(driver_options_module, 'Options')
+
+        driver_options = driver_options_klass()
+        if browser_executable_path:
+            driver_options.binary_location = browser_executable_path
+        for argument in driver_arguments:
+            driver_options.add_argument(argument)
+
+        # if driver_proxy:
+        #     agent = random.choice(AGENTS)
+        #     driver_options.add_argument(f"--user-agent='{agent}'")
+        # if driver_agent:
+        #     proxy = random.choice(PROXY)
+        #     driver_options.add_argument(f"--proxy-server='{PROXY}'")
+        #
+        #     driver_load_img = driver_load_img,
+        #     driver_disable_notify = driver_disable_notify
+
+        chrome_prefs = {"disk-cache-size": 4096}
+        if not driver_load_img:
+            chrome_prefs.update(
+                {
+                    "profile.default_content_settings": {"images": 2},
+                    "profile.managed_default_content_settings": {"images": 2}
+                }
+            )
+        if driver_disable_notify:
+            chrome_prefs.update(
+                {"profile.default_content_setting_values.notifications": 2}
+            )
+        driver_options.add_experimental_option("prefs", chrome_prefs)
+
+        driver_kwargs = {
+            'executable_path': driver_executable_path,
+            f'{driver_name}_options': driver_options
+        }
+
+        self.driver = driver_klass(**driver_kwargs)
+        # self.driver.__setattr__('click_element', self.__click_element)
+        # self.driver.__setattr__('scroll_to_bottom', self.__scroll_to_bottom)
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        """Initialize the middleware with the crawler settings"""
+
+        driver_name = crawler.settings.get('SELENIUM_DRIVER_NAME')
+        driver_executable_path = crawler.settings.get('SELENIUM_DRIVER_EXECUTABLE_PATH')
+        browser_executable_path = crawler.settings.get('SELENIUM_BROWSER_EXECUTABLE_PATH')
+        driver_arguments = crawler.settings.get('SELENIUM_DRIVER_ARGUMENTS')
+        driver_proxy = crawler.settings.get('CHANGE_PROXY', False)
+        driver_agent = crawler.settings.get('CHANGE_AGENT', False)
+        driver_load_img = crawler.settings.get('LOAD_IMAGE', True)
+        driver_disable_notify = crawler.settings.get('DISABLE_NOTIFY', True)
+
+        if not driver_name or not driver_executable_path:
+            raise NotConfigured(
+                'SELENIUM_DRIVER_NAME and SELENIUM_DRIVER_EXECUTABLE_PATH must be set'
+            )
+
+        middleware = cls(
+            driver_name=driver_name,
+            driver_executable_path=driver_executable_path,
+            driver_arguments=driver_arguments,
+            browser_executable_path=browser_executable_path,
+            driver_proxy=driver_proxy,
+            driver_agent=driver_agent,
+            driver_load_img=driver_load_img,
+            driver_disable_notify=driver_disable_notify
+        )
+
+        crawler.signals.connect(middleware.spider_closed, signals.spider_closed)
+
+        return middleware
+
+    def process_request(self, request, spider):
+        """Process a request using the selenium driver if applicable"""
+        if not isinstance(request, SeleniumRequest):
+            return None
+
+        self.driver.get(request.url)
+        time.sleep(1)
+        for cookie_name, cookie_value in request.cookies.items():
+            self.driver.add_cookie(
+                {
+                    'name': cookie_name,
+                    'value': cookie_value
+                }
+            )
+
+        if request.wait_until:
+            WebDriverWait(self.driver, request.wait_time).until(
+                request.wait_until
+            )
+
+        if request.screenshot:
+            request.meta['screenshot'] = self.driver.get_screenshot_as_png()
+
+        if request.script:
+            self.driver.execute_script(request.script)
+
+        # if 'scroll_to_bottom' in request.meta and request.meta['scroll_to_bottom']:
+        #     self.driver.scroll_to_bottom()
+
+        body = str.encode(self.driver.page_source)
+
+        # Expose the driver via the "meta" attribute
+        request.meta.update({'driver': self.driver})
+
+        return HtmlResponse(
+            self.driver.current_url,
+            body=body,
+            encoding='utf-8',
+            request=request
+        )
+
+    # def __click_element(self, element_to_click, offset=50, retries=5):
+    #     """ Try scroll and click element."""
+    #     try:
+    #         time.sleep(0.05)
+    #         location = element_to_click.location
+    #         self.driver.execute_script(f"window.scrollTo(0, {location['y'] - offset})")
+    #
+    #         ActionChains(self.driver).move_to_element(element_to_click).double_click().perform()
+    #     except:
+    #         if retries:
+    #             self.__click_element(element_to_click, offset + 50, retries - 1)
+    #         else:
+    #             raise Exception("Can't click element")
+    #
+    # def __scroll_to_bottom(self, scroll_px=2160, max_scroll=25, scroll_delay_time=0.15):
+    #     """ Scroll to bottom of page."""
+    #     location = scroll_px
+    #     # scroll_height = self.driver.execute_script("return document.body.scrollHeight")
+    #     while location < self.driver.execute_script("return document.body.scrollHeight") and max_scroll:
+    #         self.driver.execute_script(f"window.scrollTo(0, {location});")
+    #         time.sleep(scroll_delay_time)
+    #         location += scroll_px
+    #         max_scroll -= 1

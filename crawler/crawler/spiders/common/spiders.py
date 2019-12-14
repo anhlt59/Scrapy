@@ -8,8 +8,9 @@ from scrapy.utils.project import get_project_settings
 from scrapy.exceptions import CloseSpider
 from cssselect.parser import SelectorSyntaxError
 from selenium.webdriver.remote.errorhandler import InvalidSelectorException
-from twisted.internet.error import DNSLookupError
 from scrapy.spidermiddlewares.httperror import HttpError
+from twisted.internet.error import DNSLookupError
+from twisted.internet import reactor, defer
 from twisted.internet.error import TimeoutError, TCPTimedOutError
 import re
 import json
@@ -29,10 +30,13 @@ class BaseSpider(Spider):
     def __init__(self, *a, **kw):
         config_logging()
         super().__init__(*a, **kw)
+        self.logger.info(f'{self.name} is running')
 
         # check params is declared
         if not getattr(self, 'params', None):
             raise CloseSpider('Spider has no params')
+        # get config
+        self.config = obj(get_project_settings()['ATTRIBUTES'])
 
     def parse_data(self, response):
         self.bidDatas = json.loads(response.body)
@@ -41,27 +45,37 @@ class BaseSpider(Spider):
             raise CloseSpider(f'{self.name} - BidDatas is empty - crawl done')
 
     def post_item(self, item):
-        # post_link = 'http://192.168.1.142:82/api/v1/crawl/hotel/a?log=1&json=1'
-        post_link = f'{item.post_link}?json=1'
+        if '?' not in item.post_link:
+            post_link = f'{item.post_link}?json=1'
+        else:
+            post_link = f'{item.post_link}json=1'
         return JsonRequest(post_link, method='POST', data=item, dont_filter=True,
-                           callback=self.post_success, errback=self.post_fail)
+                           callback=self.post_success, errback=self.parse_fail)
 
     def post_success(self, response):
         # logs success
-        self.logger.info(f'Post item done - {response.status}')
+        # self.logger.info(f'Post item done - got {response.status}')
+        pass
 
-    def post_fail(self, failure):
+    def parse_fail(self, failure):
         # logs failures
-        if failure.check(HttpError): 
-           response = failure.value.response 
-           self.logger.error(f"HttpError occurred on {response.url} - got {response.status}")  
-      
-        elif failure.check(DNSLookupError): 
-            self.logger.error(f"DNSLookupError occurred on {failure.request.url}") 
+        if failure.check(HttpError):
+            response = failure.value.response
+            status = response.status
+            self.logger.error(f"HttpError occurred on {response.url} - got {status}")
+            if status == 504:
+                self.logger.info('Waiting for Splash restart - 30s')
+                request = failure.request
+                d = defer.Deferred()
+                reactor.callLater(30.0, d.callback, request)
+                return d
+
+        elif failure.check(DNSLookupError):
+            self.logger.error(f"DNSLookupError occurred on {failure.request.url}")
             raise CloseSpider("DNSLookupError")
 
-        elif failure.check(TimeoutError, TCPTimedOutError): 
-            self.logger.error(f"TimeoutError occurred on {failure.request.url}") 
+        elif failure.check(TimeoutError, TCPTimedOutError):
+            self.logger.error(f"TimeoutError occurred on {failure.request.url}")
             raise CloseSpider(f"TimeoutError")
         # self.logger.error(repr(failure))
 
@@ -77,22 +91,20 @@ class CatSpider(BaseSpider):
         'DOWNLOADER_MIDDLEWARES': {
             'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
             'crawler.middlewares.ScheduleRequestSpiderMiddleware': 100,
-            'scrapy.downloadermiddlewares.UserAgentMiddleware': None,
-            'crawler.middlewares.CustomUserAgentProxyMiddleware': 400,
+            'scrapy.downloadermiddlewares.useragent.UserAgentMiddleware': None,
+            'scrapy_fake_useragent.middleware.RandomUserAgentMiddleware': 400,
+            'scrapy.downloadermiddlewares.retry.RetryMiddleware': 550,
+            # 'crawler.middlewares.CustomRotatingProxyMiddleware': 610,
+            # 'rotating_proxies.middlewares.BanDetectionMiddleware': 620,
             'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': 810,
         },
-        'RETRY_TIMES': 10,
     }
-
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self.url = f'http://crawler.wemarry.vn/api/get-cat-multi?id={self.params}'
-        self.logger.info(f'{self.name} is running')
 
     def start_requests(self):
         # get cat data
         if not hasattr(self, 'bidDatas'):
-            yield JsonRequest(self.url, callback=self.parse_data, dont_filter=True)
+            url = f'http://crawler.wemarry.vn/api/get-cat-multi?id={self.params}'
+            yield JsonRequest(url, callback=self.parse_data, dont_filter=True)
 
         # create requests
         if getattr(self, 'bidDatas', None):
@@ -109,8 +121,8 @@ class CatSpider(BaseSpider):
             for request in self.create_request(item):
                 yield request
 
-    def create_request(self, item):
-        yield Request(url=item.link, callback=self.parse, meta={'item': item})
+    def create_request(self, item, retries=3):
+        yield Request(url=item.link, callback=self.parse, meta={'item': item, 'retries': retries})
 
     def parse(self, response):
         item = request.meta.get('item')
@@ -160,23 +172,23 @@ class DetailSpider(BaseSpider):
         'DOWNLOADER_MIDDLEWARES': {
             'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
             'crawler.middlewares.ScheduleRequestSpiderMiddleware': 100,
-            'scrapy.downloadermiddlewares.UserAgentMiddleware': None,
-            'crawler.middlewares.CustomUserAgentProxyMiddleware': 400,
+            'scrapy.downloadermiddlewares.useragent.UserAgentMiddleware': None,
+            'scrapy_fake_useragent.middleware.RandomUserAgentMiddleware': 400,
+            'scrapy.downloadermiddlewares.retry.RetryMiddleware': 550,
+            # 'crawler.middlewares.CustomRotatingProxyMiddleware': 610,
+            # 'rotating_proxies.middlewares.BanDetectionMiddleware': 620,
             'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': 810,
         },
-        'RETRY_TIMES': 10,
     }
-
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self.url = f'http://crawler.wemarry.vn/api/get-detail-multi?id={self.params}'
-        self.logger.info(f'{self.name} is running')
+    page = 0
 
     def start_requests(self):
         # get cat data
-        if not hasattr(self, 'bidDatas'):# or not self.bidDatas:
-            yield JsonRequest(self.url, callback=self.parse_data, dont_filter=True)
-        # create requests   
+        if not hasattr(self, 'bidDatas') or not self.bidDatas:
+            self.page += 1
+            url = f'http://crawler.wemarry.vn/api/get-detail-multi?id={self.params}&page={self.page}'
+            yield JsonRequest(url, callback=self.parse_data, dont_filter=True)
+        # create requests
         if getattr(self, 'bidDatas', None):
             data = self.bidDatas.pop()
             item = obj(
@@ -204,8 +216,8 @@ class DetailSpider(BaseSpider):
             for request in self.create_request(item):
                 yield request
 
-    def create_request(self, item):
-        yield Request(url=item.link, callback=self.parse, meta={'item': item})
+    def create_request(self, item, retries=3):
+        yield Request(url=item.link, callback=self.parse, meta={'item': item, 'retries': retries})
 
     def parse(self, response):
         item = response.meta.get('item')
@@ -219,8 +231,6 @@ class DetailSpider(BaseSpider):
         self.count += 1
         self.logger.info(f"crawl {item.link} done - total {self.count}")
         yield self.post_item(item)
-        # from pprint import pprint 
-        # pprint(item)
 
 
 class SplashCat(CatSpider):
@@ -231,14 +241,15 @@ class SplashCat(CatSpider):
         'DOWNLOADER_MIDDLEWARES': {
             'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
             'crawler.middlewares.ScheduleRequestSpiderMiddleware': 100,
-            # 'crawler.middlewares.CustomRetryMiddleware': 120,
-            'scrapy.downloadermiddlewares.UserAgentMiddleware': None,
-            'crawler.middlewares.CustomUserAgentProxyMiddleware': 400,
+            'scrapy.downloadermiddlewares.useragent.UserAgentMiddleware': None,
+            'scrapy_fake_useragent.middleware.RandomUserAgentMiddleware': 400,
+            'scrapy.downloadermiddlewares.retry.RetryMiddleware': 550,
+            # 'crawler.middlewares.CustomRotatingProxyMiddleware': 610,
+            # 'rotating_proxies.middlewares.BanDetectionMiddleware': 620,
             'scrapy_splash.SplashCookiesMiddleware': 723,
             'scrapy_splash.SplashMiddleware': 725,
             'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': 810,
         },
-        'RETRY_TIMES': 10,
     }
     script = """
     function main(splash, args)
@@ -257,23 +268,8 @@ class SplashCat(CatSpider):
     """
 
     def create_request(self, item, retries=3):
-        yield SplashRequest(item.link, callback=self.parse, errback=self.retry_request, endpoint='execute',
-                            dont_filter=True, meta={'item': item, 'retries':retries}, 
-                            args={'lua_source': self.script, 'wait': 1},)  
-
-    def retry_request(self, failure):
-        retries = failure.request.meta.get('retries')
-        item = failure.request.meta.get('item')
-        if retries:
-            self.logger.info('retry request')
-            yield SplashRequest(item.link, callback=self.parse, errback=self.retry_request, endpoint='execute',
-                                dont_filter=True, meta={'item': item, 'retries':retries - 1}, 
-                                args={'lua_source': self.script, 'wait': 1},)  
-        else:
-            self.logger.critical('error 404')
-
-    # def parse(self, response):
-    #     super()
+        yield SplashRequest(item.link, callback=self.parse, errback=self.parse_fail, endpoint='execute', dont_filter=True,
+                            meta={'item': item, 'retries': retries}, args={'lua_source': self.script, 'wait': 1},)
 
 
 class SplashDetail(DetailSpider):
@@ -284,14 +280,15 @@ class SplashDetail(DetailSpider):
         'DOWNLOADER_MIDDLEWARES': {
             'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
             'crawler.middlewares.ScheduleRequestSpiderMiddleware': 100,
-            # 'crawler.middlewares.CustomRetryMiddleware': 120,
-            'scrapy.downloadermiddlewares.UserAgentMiddleware': None,
-            'crawler.middlewares.CustomUserAgentProxyMiddleware': 400,
+            'scrapy.downloadermiddlewares.useragent.UserAgentMiddleware': None,
+            'scrapy_fake_useragent.middleware.RandomUserAgentMiddleware': 400,
+            'scrapy.downloadermiddlewares.retry.RetryMiddleware': 550,
+            # 'crawler.middlewares.CustomRotatingProxyMiddleware': 610,
+            # 'rotating_proxies.middlewares.BanDetectionMiddleware': 620,
             'scrapy_splash.SplashCookiesMiddleware': 723,
             'scrapy_splash.SplashMiddleware': 725,
             'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': 810,
         },
-        'RETRY_TIMES': 10,
     }
     script = """
     function main(splash, args)
@@ -309,30 +306,9 @@ class SplashDetail(DetailSpider):
     end
     """
 
-    # def __init__(self, *a, **kw):
-    #     super()
-
-    # def start_requests(self):
-    #     super()
-
     def create_request(self, item, retries=3):
-        yield SplashRequest(item.link, callback=self.parse, endpoint='execute',#, errback=self.retry_request
-                            dont_filter=True, meta={'item': item, 'retries':retries}, 
-                            args={'lua_source': self.script, 'wait': 1},)  
-
-    def retry_request(self, failure):
-        retries = failure.request.meta.get('retries')
-        item = failure.request.meta.get('item')
-        if retries:
-            self.logger.info('retry request')
-            yield SplashRequest(item.link, callback=self.parse, errback=self.retry_request, endpoint='execute',
-                                dont_filter=True, meta={'item': item, 'retries':retries - 1}, 
-                                args={'lua_source': self.script, 'wait': 1},)  
-        else:
-            self.logger.critical('error 404')
-
-    # def parse(self, response):
-    #     super()
+        yield SplashRequest(item.link, callback=self.parse, errback=self.parse_fail, endpoint='execute', dont_filter=True,
+                            meta={'item': item}, args={'lua_source': self.script, 'wait': 1},)
 
 
 class SeleniumCat(CatSpider):
@@ -344,7 +320,114 @@ class SeleniumCat(CatSpider):
             'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
             'crawler.middlewares.ScheduleRequestSpiderMiddleware': 100,
             'scrapy.downloadermiddlewares.useragent.UserAgentMiddleware': None,
-            'crawler.middlewares.CustomUserAgentProxyMiddleware': 400,
+            'scrapy_fake_useragent.middleware.RandomUserAgentMiddleware': 400,
+            'scrapy.downloadermiddlewares.retry.RetryMiddleware': 550,
+            # 'crawler.middlewares.CustomRotatingProxyMiddleware': 610,
+            # 'rotating_proxies.middlewares.BanDetectionMiddleware': 620,
+            'crawler.middlewares.CustomSeleniumMiddleware': 800,
+            'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': 810,
+        },
+    }
+    params = None
+
+    # def create_request(self, item):
+    #     yield SeleniumRequest(url=item.link, callback=self.parse, meta={'item': item})
+    #
+    # def parse(self, response):
+    #     driver = response.meta.get('driver', None)
+    #     if not driver or not item:
+    #         self.logger.error("Cant init ")
+    #         raise CloseSpider("Cant init ")
+    #
+    #     item = response.meta.get('item', None)
+    #     link_detail = item.link_detail
+    #     law_next_page = item.law_next_page
+    #
+    #     if not link_detail or not law_next_page:
+    #         self.logger.error("Link_DETAIl or LAW_NEXT_PAGE is not set")
+    #         raise CloseSpider("Link_DETAIl or LAW_NEXT_PAGE is not set")
+    #
+    #
+    #     link_detail = data.get('Link_DETAIl')
+    #     law_next_page = data.get('LAW_NEXT_PAGE')
+    #
+    #     item = dict(
+    #         id_web=data.get('ID_WEB'),
+    #         # link=data.get('LINK'),
+    #         domain=data.get('DOMAIN'),
+    #         website=data.get('WEBSITE'),
+    #         active=data.get('ACTIVE'),
+    #         post_link=data.get('POST_LINK'),
+    #         lang_web=data.get('LANG_WEB'),
+    #         link_detail=link_detail,
+    #         law_next_page=law_next_page,
+    #     )
+    #
+    #     if not law_next_page:
+    #         yield self.parse_item(driver, response, item)
+    #     else:
+    #         driver.scroll_to_bottom()
+    #
+    #         try:
+    #             element_next_page = driver.find_element_by_css_selector(law_next_page)
+    #         except InvalidSelectorException:
+    #             element_next_page = None
+    #
+    #         while True:
+    #             link = driver.current_url
+    #             item.update(link=link)
+    #
+    #             result = self.parse_item(driver, response, item)
+    #             if result['cat_link']:
+    #                 yield result
+    #             else:
+    #                 return None
+    #
+    #             if element_next_page:
+    #                 # nextpage by interac with browser
+    #                 next_page_url = element_next_page.get_attribute("href")
+    #
+    #                 if next_page_url:
+    #                     driver.get(next_page_url)
+    #                 else:
+    #                     driver.click_element(element_next_page)
+    #
+    #                 driver.scroll_to_bottom()
+    #                 try:
+    #                     element_next_page = driver.find_element_by_css_selector(law_next_page)
+    #                 except:
+    #                     return None
+    #
+    #             else:
+    #                 # nextpage by rule
+    #                 page_no = re.search(rf'(?<={law_next_page})\d+', link)
+    #                 if page_no:
+    #                     nextpage = int(page_no.group()) + 1
+    #                     abs_next_page_url = re.sub(rf'(?<={law_next_page})\d+', str(nextpage), link)
+    #                     # print(abs_next_page_url)
+    #                     driver.get(abs_next_page_url)
+    #                     driver.scroll_to_bottom()
+    #                 else:
+    #                     return None
+    #
+    # def parse_item(self, driver, response, item):
+    #     selector = Selector(text=driver.page_source)
+    #     cat_link = [response.urljoin(url) for url in selector.css(f"{item['link_detail']}::attr(href)").extract()]
+    #     self.logger.info(f'{item["link"]} - done !')
+    #     return dict(**item, cat_link=cat_link)
+
+
+class SeleniumDetail(DetailSpider):
+
+    name = "SeleniumDetail"
+    custom_settings = {
+        **get_project_settings(),
+        'DOWNLOADER_MIDDLEWARES': {
+            'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
+            'crawler.middlewares.ScheduleRequestSpiderMiddleware': 100,
+            'scrapy.downloadermiddlewares.useragent.UserAgentMiddleware': None,
+            'scrapy_fake_useragent.middleware.RandomUserAgentMiddleware': 400,
+            'scrapy.downloadermiddlewares.retry.RetryMiddleware': 550,
             'crawler.middlewares.CustomSeleniumMiddleware': 800,
             'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': 810,
         },
@@ -354,145 +437,45 @@ class SeleniumCat(CatSpider):
     def create_request(self, item):
         yield SeleniumRequest(url=item.link, callback=self.parse, meta={'item': item})
 
-    def parse(self, response):
-        driver = response.meta.get('driver', None)
-        if not driver or not item:
-            self.logger.error("Cant init ")
-            raise CloseSpider("Cant init ")
-        
-        item = response.meta.get('item', None)
-        link_detail = item.link_detail
-        law_next_page = item.law_next_page
+    # def __init__(self, *a, **kw):
+    #     config_logging()
+    #     super().__init__(*a, **kw)
+    #
+    # def start_requests(self):
+    #     if not getattr(self, 'url', None):
+    #
+    #         return None
+    #
+    #     if not getattr(self, 'bidDatas', None) or not self.bidDatas:
+    #         self.bidDatas = request_url(self.url, params={'reset': 1})
+    #
+    #     if self.bidDatas:
+    #         item = self.bidDatas.pop()
+    #         yield SeleniumRequest(url=item['LINK'], callback=self.parse, meta={'DATA': item, 'scroll_to_bottom': True})
 
-        if not link_detail or not law_next_page:
-            self.logger.error("Link_DETAIl or LAW_NEXT_PAGE is not set")
-            raise CloseSpider("Link_DETAIl or LAW_NEXT_PAGE is not set")
-
-
-        link_detail = data.get('Link_DETAIl')
-        law_next_page = data.get('LAW_NEXT_PAGE')
-
-        item = dict(
-            id_web=data.get('ID_WEB'),
-            # link=data.get('LINK'),
-            domain=data.get('DOMAIN'),
-            website=data.get('WEBSITE'),
-            active=data.get('ACTIVE'),
-            post_link=data.get('POST_LINK'),
-            lang_web=data.get('LANG_WEB'),
-            link_detail=link_detail,
-            law_next_page=law_next_page,
-        )
-
-        if not law_next_page:
-            yield self.parse_item(driver, response, item)
-        else:
-            driver.scroll_to_bottom()
-
-            try:
-                element_next_page = driver.find_element_by_css_selector(law_next_page)
-            except InvalidSelectorException:
-                element_next_page = None
-
-            while True:
-                link = driver.current_url
-                item.update(link=link)
-
-                result = self.parse_item(driver, response, item)
-                if result['cat_link']:
-                    yield result
-                else:
-                    return None
-
-                if element_next_page:
-                    # nextpage by interac with browser
-                    next_page_url = element_next_page.get_attribute("href")
-
-                    if next_page_url:
-                        driver.get(next_page_url)
-                    else:
-                        driver.click_element(element_next_page)
-
-                    driver.scroll_to_bottom()
-                    try:
-                        element_next_page = driver.find_element_by_css_selector(law_next_page)
-                    except:
-                        return None
-
-                else:
-                    # nextpage by rule
-                    page_no = re.search(rf'(?<={law_next_page})\d+', link)
-                    if page_no:
-                        nextpage = int(page_no.group()) + 1
-                        abs_next_page_url = re.sub(rf'(?<={law_next_page})\d+', str(nextpage), link)
-                        # print(abs_next_page_url)
-                        driver.get(abs_next_page_url)
-                        driver.scroll_to_bottom()
-                    else:
-                        return None
-
-    def parse_item(self, driver, response, item):
-        selector = Selector(text=driver.page_source)
-        cat_link = [response.urljoin(url) for url in selector.css(f"{item['link_detail']}::attr(href)").extract()]
-        self.logger.info(f'{item["link"]} - done !')
-        return dict(**item, cat_link=cat_link)
-
-
-class SeleniumDetail(Spider):
-
-    name = "SeleniumDetail"
-    custom_settings = {
-        **get_project_settings(),
-        'DOWNLOADER_MIDDLEWARES': {
-            'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
-            'crawler.middlewares.ScheduleRequestSpiderMiddleware': 100,
-            'scrapy.downloadermiddlewares.useragent.UserAgentMiddleware': None,
-            'crawler.middlewares.CustomUserAgentProxyMiddleware': 400,
-            'crawler.middlewares.CustomSeleniumMiddleware': 800,
-            'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': 810,
-        },
-    }
-    params = None
-
-    def __init__(self, *a, **kw):
-        config_logging()
-        super().__init__(*a, **kw)
-        # self.url must be declared
-
-    def start_requests(self):
-        if not getattr(self, 'url', None):
-            return None
-
-        if not getattr(self, 'bidDatas', None) or not self.bidDatas:
-            self.bidDatas = request_url(self.url, params={'reset': 1})
-
-        if self.bidDatas:
-            item = self.bidDatas.pop()
-            yield SeleniumRequest(url=item['LINK'], callback=self.parse, meta={'DATA': item, 'scroll_to_bottom': True})
-
-    def parse(self, response):
-        driver = response.meta.get('driver', None)
-        data = response.meta.get('DATA', None)
-
-        if not driver or not data:
-            return None
-
-        driver.implicitly_wait(2)
-
-        item = dict(
-            id_web=data.get('ID_WEB'),
-            id=data.get('ID'),
-            link=data.get('LINK'),
-            domain=data.get('DOMAIN'),
-            website=data.get('WEBSITE'),
-            active=data.get('ACTIVE'),
-            post_link=data.get('POST_LINK'),
-            lang_web=data.get('LANG_WEB'),
-            link_detail=data.get('Link_DETAIl'),
-            law_next_page=data.get('LAW_NEXT_PAGE')
-        )
-
-        set_law(item, data['ARR_LAW'], Selector(text=driver.page_source))
-        self.logger.info(f'{item["link"]} - done !')
-
-        yield item
+    # def parse(self, response):
+    #     driver = response.meta.get('driver', None)
+    #     data = response.meta.get('DATA', None)
+    #
+    #     if not driver or not data:
+    #         return None
+    #
+    #     driver.implicitly_wait(2)
+    #
+    #     item = dict(
+    #         id_web=data.get('ID_WEB'),
+    #         id=data.get('ID'),
+    #         link=data.get('LINK'),
+    #         domain=data.get('DOMAIN'),
+    #         website=data.get('WEBSITE'),
+    #         active=data.get('ACTIVE'),
+    #         post_link=data.get('POST_LINK'),
+    #         lang_web=data.get('LANG_WEB'),
+    #         link_detail=data.get('Link_DETAIl'),
+    #         law_next_page=data.get('LAW_NEXT_PAGE')
+    #     )
+    #
+    #     set_law(item, data['ARR_LAW'], Selector(text=driver.page_source))
+    #     self.logger.info(f'{item["link"]} - done !')
+    #
+    #     yield item

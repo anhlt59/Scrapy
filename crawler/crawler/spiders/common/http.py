@@ -114,8 +114,7 @@ class ApiSplashRequest(Request):
         # requests against AjaxCrawlMiddleware
         meta['ajax_crawlable'] = True
 
-        super(ApiSplashRequest, self).__init__(url, callback, method, meta=meta,
-                                            **kwargs)
+        super(ApiSplashRequest, self).__init__(url, callback, method, meta=meta, **kwargs)
 
     @property
     def _processed(self):

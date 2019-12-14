@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger("run")
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--spider', dest='spider', type=str, 
+parser.add_argument('--spider', dest='spider', type=str,
                     help='"cat" - run Category, "detail" - run Detail, "SpiderName,..." - run spiders with name, "all" - run all spider')
 parser.add_argument('--transport', dest='transport', type=str,
                     help='"all" - run transport all spider, "SpiderName,..." - run transport with specific name')
@@ -39,7 +39,7 @@ def crawl(settings, logger):
     # filter by argrument passed
     if args.spider == 'all':
         filted_spider_name_list = total_spider_name_list
-    elif args.spider in ['cat', 'detail']:
+    elif args.spider in ['cat', 'detail', 'review']:
         filted_spider_name_list = [name for name in total_spider_name_list if args.spider.lower() in name.lower()]
     else:
         filted_spider_name_list = [name for name in total_spider_name_list if name.lower() in args.spider.lower().split(',')]
@@ -50,8 +50,8 @@ def crawl(settings, logger):
     # run spider
     process = CrawlerProcess()
     for spider in spiders:
-        process.crawl(spider)
-
+        if spider.params:
+            process.crawl(spider)
     try:
         process.start()
     # except ReactorNotRestartable as e:
@@ -87,9 +87,7 @@ def transport(settings, logger):
 
         for item in data:
             post_link = item['post_link']
-            payload = {
-                'data' : json.dumps(item)
-            }
+            payload = json.dumps(item)
             # item = json.dumps(item)
             # pub = r.publish(
             #     channel=CHANNEL,
@@ -100,7 +98,9 @@ def transport(settings, logger):
 
             try:
                 response = await session.post(url=post_link, data=payload, params=params, ssl=False)
-                resp.raise_for_status()
+                # a = await response.text()
+                # print(a)
+                response.raise_for_status()
                 await asyncio.sleep(2)
 
                 await session.post(url=success_url, data=payload, params=params, ssl=False)
@@ -110,14 +110,18 @@ def transport(settings, logger):
                 await session.request(method='POST',url=fail_url, data=payload, params=params, ssl=False)
                 logger.info(f"Post {item['post_link']} - {err}")
 
+        # exit if data if null
+        else:
+            sys.exit()
+
     async def transport_main(params_list, logger):
         async with ClientSession() as session:
             tasks = [progress_transport(params, session, logger) for params in params_list]
             await asyncio.gather(*tasks)
-    
+
     transport_logger = logger.getChild('transport')
 
-    # get all spider_name 
+    # get all spider_name
     spider_loader = spiderloader.SpiderLoader.from_settings(settings)
     total_spider_name_list = spider_loader.list()
 
@@ -137,9 +141,10 @@ def transport(settings, logger):
     # run transport_main
     # asyncio.run(transport_main(params_list, transport_logger))
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(transport_main(params_list, transport_logger))
+    while True:
+        loop.run_until_complete(transport_main(params_list, transport_logger))
     loop.close()
-    
+
 
 if __name__ == '__main__':
     settings = get_project_settings()
