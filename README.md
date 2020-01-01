@@ -1,3 +1,2 @@
-# Scrapy - crawl hotel and restaurant
-
+# Scrapy
 Profiles Scrapy code.
